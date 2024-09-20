@@ -1,0 +1,478 @@
+---
+title: "NYC Rental Bike"
+author: "Rodrigo Lizaran-Molina, Noah Poremba, Allen Phu, Samar Marwah"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Introduction
+
+```{r setup, include=FALSE}
+# control global Rmd chunk settings
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+### Background
+
+Bike rentals in New York City are an essential feature of New York, offering residents and visitors an alternative, eco-friendly mode of transportation against the backdrop of the city's iconic skyline. Whether it's cruising through Central Park, navigating bustling streets, or exploring scenic waterfronts, the city's bike-sharing services provide a dynamic and accessible way to experience the diverse neighborhoods and cultural phenomena. With an extensive network of bike stations scattered across the boroughs, riders can easily access the city's  blend of neighborhoods, parks, and historic landmarks. Beyond just a means of getting from point A to B, these rentals have become an integral part of the city's lifestyle, promoting a healthier, more sustainable urban environment for New York.
+
+In our data analysis we first look to explore the connection between New York City's bike rentals and factors such as day of the week and and month to see how they effect bike rental volumes. Then with a separate data set of 2022 New York weather metrics, we look to cross examine it with our bike rental data,to explore potential patterns and gain insights into the dynamics of weather and bike rentals. Our primary focus will involve examining how bike rental volumes correlate with  weather nuances such temperature. Essential questions like "How does weather impact bike rentals?" are driving our investigation, pushing us to understand whether specific weather conditions serve as catalysts or deterrents for people opting for a bike ride. Additionally, we're venturing into predictive analysis to determine whether we can confidently anticipate the volume of bike rentals based on weather conditions, and what day/month it is. Through this exploration, we aim to provide a comprehensive understanding of what contributes to the volume of bike rentals in the dynamic landscape of New York City.
+
+
+
+### Question
+
+Our main question is as follows: Can we use weather, day of the week and month as an accurate predictor for the volume of bike rentals? As well as we aim to dive deeper and explore other patterns such as What are the most populous forms of bike? and what stations have the most amound of rental volume?  
+
+## The Data
+
+### Data Explanation
+
+Bike Rental data: This data was extracted from the NYC bike rental website (https://citibikenyc.com/system-data). We decided to extract the information of every month of the year 2022 and merge it all together into one data set. This data set was to big to be used with our current means, so we decided to extract the 10% of the data and work with that sample for the rest of the project. The variables within the data are: Ride ID, Rideable type (normal or e-bike),Started at (time of start), Ended at (end time), Start station name (name of the station), Start station ID (id of the start station),End station name, End station ID, Start latitude (Start Station Latitude), Start longitude (Start Station longitude), End latitude (End Station Latitude),End Longitude (End Station longitude), Member_casual_ride (either casual or member)
+  
+
+Weather data: This data set contains the weather temperature, precipitation and conditions for the year 2022. It has being filtered and extracted from (https://www.visualcrossing.com/weather/weather-data-services). The only wrangling needed would be to extract the datetime column into year, month and day, same as needed for the bike rental data to later be merged and analyzed.
+
+### Load packages
+```{r load-packages, message=FALSE}
+library(ggrepel)
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(rstatix)
+library(cowplot)
+library(olsrr)
+library(sf)
+library(maps)
+library(rnaturalearth)
+```
+
+
+### Data Import
+```{r}
+# Load csv files for the CitiBike Rental
+bike_rental <- read.csv("data/sample_10percent.csv")
+
+# Load Weather File
+weather <- read.csv("data/NYC_Weather_2022.csv")
+```
+
+### Data wrangling
+
+#### Bike Rental
+```{r}
+# Convert 'started_at' column to a POSIXct object
+bike_rental$started_at <- ymd_hms(bike_rental$started_at)
+bike_rental$ended_at <- ymd_hms(bike_rental$ended_at)
+
+# Extract year, month, day, and hour into new columns
+bike_rental <- bike_rental |>
+  mutate(
+    year = year(started_at),
+    month = month(started_at),
+    day = day(started_at),
+    hour = hour(started_at),
+    day_of_week = wday(started_at, label = TRUE)  # Get the day of the week as a label
+  )
+
+# Extract hour, minute, and second from each datetime column
+bike_rental <- bike_rental |>
+  mutate(
+    ride_time = as.numeric(difftime(ended_at, started_at, units = "secs")),
+  )
+```
+
+In the above section, we looked at the 'started_at' and 'ended_at' columns of the bike rental data set, converting them to the appropriate date and time. Then, we created 5 new columns (year, month, day, hour, day_of_week), each extracted from the 'started_at' column and added what day of the week correspond to. Additionally, a new column 'ride_time' was created to indicate the total ride time in seconds per rental.
+
+#### Station
+```{r}
+# Create new dataframe with the station name from start point
+station_start_usage <- bike_rental |>
+  group_by(start_station_name, year) |>
+  summarise(usage = n()) |>
+  ungroup()
+
+# Create new dataframe with the station name from end point
+station_end_usage <- bike_rental |>
+  group_by(end_station_name, year) |>
+  summarise(usage = n()) |>
+  ungroup()
+
+# Top 10 start stations
+top_start_stations <- station_start_usage |>
+  group_by(start_station_name) |>
+  summarise(total_usage = sum(usage)) |>
+  top_n(10, total_usage) |>
+  pull(start_station_name)
+
+# Top 10 end stations
+top_end_stations <- station_end_usage |>
+  group_by(end_station_name) |>
+  summarise(total_usage = sum(usage)) |>
+  top_n(10, total_usage) |>
+  pull(end_station_name)
+  
+#  Filter to top 10 stations
+top_start_station_usage <- station_start_usage |>
+  filter(start_station_name %in% top_start_stations) |>
+  rename(station_name = start_station_name)
+
+# Filter to top 10 stations
+top_end_station_usage <- station_end_usage |>
+  filter(end_station_name %in% top_end_stations) |>
+  rename(station_name = end_station_name)
+
+# Store new dataframe of station names with their lat and lng
+aggregated_info <- bike_rental |>
+  filter(start_station_name %in% station_start_usage$start_station_name) |>
+  group_by(start_station_name) |>
+  summarise(start_lat = mean(start_lat), start_lng = (start_lng))|>
+  distinct(start_station_name, .keep_all = TRUE) |>
+  rename(station_name = start_station_name)
+
+# Get top 10 start stations latitudes and longitude
+top_start_station_usage <- top_start_station_usage |>
+  left_join(aggregated_info, by='station_name')
+
+# Get top 10 end stations latitudes and longitude
+top_end_station_usage <- top_end_station_usage |>
+  left_join(aggregated_info, by='station_name')
+```
+
+The above code identifies the ten most frequently used starting and ending stations by users for their trips throughout the year 2022. Additionally, it extracts and records the latitude and longitude coordinates corresponding to these stations. These coordinates are intended for later use, potentially for mapping or visual representation.
+
+#### Weather
+```{r}
+# Add new columns that hold year, month and day from the datetime column
+weather$datetime <- ymd(weather$datetime)
+
+weather <- weather |>
+  mutate(
+    year = year(datetime),
+    month = month(datetime),
+    day = day(datetime),
+  )
+```
+
+The above section has to do with the weather data set, where the date and time were initially properly converted using the ymd function. After that, 3 new columns were created (year, month, day) after extraction from the newly converted 'datetime' column.
+
+#### Grouped Data
+```{r}
+# Create new Dataframe grouped by day and month.
+group_bike_day_month <- bike_rental |>
+  group_by(day, month,day_of_week) |>
+  summarise(
+    total_rides = n()
+  )
+
+# Create new Dataframe grouped by month.
+group_bike_month <- bike_rental |>
+  group_by(month) |>
+  summarise(
+    total_rides = n()
+  )
+```
+
+Two new data frames were created in the above chunk. The first, 'group_bike_day_month', creates a data frame that displays how many bike rental occurred for each day in the year and day of the week, organized by month and day. The second data frame, 'group_bike_month', calculates the total number of bike rentals exclusively by month.
+
+```{r}
+group_bike_day_month
+
+bike_day_month_weather <- merge(group_bike_day_month, weather, by = c("month", "day")) |>
+  select(year,month, day, total_rides, tempmax, tempmin, temp, conditions, icon)
+
+head(bike_day_month_weather)
+```
+
+The first tibble shown above displays how many bikes were rented each day for 365 days in the year and what day of the week correspond to. The second tibble, 'bike_day_month_weather', was created above and the first 6 rows are displayed. This data frame combines the 'group_bike_day_month' and the 'weather' data set, so these can be compared later in the report. 
+
+```{r}
+# group weather by month and calculate avg tempmax, tempmin, temp
+weather_month <- weather |>
+  group_by(month) |>
+  summarise(
+    tempmax = mean(tempmax),
+    tempmin = mean(tempmin),
+    temp = mean(temp)
+  )
+
+# Combine both dataframes on month and select columns to use
+bike_month_weather <- merge(group_bike_month, weather_month, by = "month") |>
+  select(month, total_rides, tempmax, tempmin, temp)
+```
+
+The first new data frame created above is 'weather_month', which calculated the average of the weather columns and groups them for each month. The second data frame, 'bike_month_weather', takes the new 'weather_month' data frame and adds that to the 'group_bike_month' data frame to display total bike rentals per month with the associated weather in each month.
+
+
+
+## Analysis
+
+### Data Analysis
+
+We decided to run a linear regression model, estimating the total number of bike rides based on day of the month, average temperature for that given day, and the month of the year.
+
+After this, we decided to fit our model.
+
+
+```{r rides based on Day of Month, Temperature}
+# let's try predicting total rides based on day of the month, temperature, conditions, icon
+total_rentals_linreg_ridesDayTemp <-  
+  linear_reg() |>
+  set_engine("lm") |>
+  fit(total_rides ~ day + temp + month, data = bike_day_month_weather)
+
+total_rentals_linreg_ridesDayTemp |>
+  glance()
+```
+
+
+As can be seen from our output, our model has a somewhat high r-squared and adjusted r-squared, at just a little bit over 73.9%. Therefore, we can conclude that average daily temperature, day of the month, and month of the year do all have at least some effect on the number of bike rides in NYC.
+
+To confirm our discoveries, we decided to compare all possible models.
+
+```{r}
+ridesDayTemp <- lm(total_rides ~ day + temp + month, data=bike_day_month_weather)
+
+ols_step_all_possible(ridesDayTemp) |>
+    arrange(desc(adjr))
+
+# variables to be removed ARE: "day" and "icon"
+```
+
+We see here that, although day and month seemed to be significant at an initial glance, they have very low r-squared values once we remove average daily temperature from the model.
+From here, we've concluded that, at least, average daily temperature has a relatively large impact on the number of total rides. Logically, this makes sense.
+
+We decided to do some further investigations regarding weather/temperature.
+
+At a quick glance, while we do have a lot of helpful, detailed data from the *conditions* variable, the *icon* variable is also more succinct and generalized. It describes weather at a decent enough detail level.
+
+```{r}
+unique(weather$conditions)
+```
+
+```{r}
+unique(weather$icon)
+```
+
+We decided to fit another model, predicting the number of total rides based on average daily temperature, weather conditions, and the weather icon used.
+
+```{r rides based on Conditions and Icon used for data}
+# slim it down to just icon/conditions
+
+total_rentals_tempConditionsIcon <-  
+  linear_reg() |>
+  set_engine("lm") |>
+  fit(total_rides ~ temp + conditions + icon, data = bike_day_month_weather)
+
+total_rentals_tempConditionsIcon |>
+  glance()
+```
+
+Again, we had a high r-squared and adjusted r-squared value; even higher than last time. However, we wanted to check and make sure it wasn't just the *temperature* variable keeping the r-squared up.
+
+```{r}
+ridesTempConditionsIcon <- lm(total_rides ~ temp + conditions + icon, data=bike_day_month_weather)
+
+ols_step_all_possible(ridesTempConditionsIcon)
+
+# overall very LOW r-squared values for these three predictors
+```
+Although our last model seemed to explain a lot of variability in the number of total bike rides, again, this was just a result of the *temperature* variable keeping the r-squared up. While our r-squared values weren't particularly promising, we did look back to the model's main effects to see if we could find any other trends.
+
+
+```{r}
+total_rentals_tempConditionsIcon |>
+  tidy() |>
+  arrange(desc(estimate))
+```
+
+Some of the trends we noticed were to be expected: in harsh weather, such as "Snow, Rain, Freezing Drizzle/Freezing Rain, Ice, Overcast" and "Rain, Freezing Drizzle/Freezing Rain, Partially cloudy" conditions, foregoing all other variables, there would be a predicted decrease of, on average, roughly 2,500 *less* total rides for any given day. In milder weather conditions, such as only partial cloudiness or rain, foregoing all other variables, there would be a predicted increase of, on average, roughly 494 and 716 *more* total rides for any given day. 
+Although there were some odd trends that the model predicted that popped up, such as *more* rides when the weather was snowy and partially cloudy, we believe that these could be a result of outliers, as is evident, again, by the low r-squared of the *conditions* variable of 23.5%.
+
+
+### Exploratory Data Analysis
+
+#### Most rented type of bike and day of the week with most rentals
+
+```{r}
+# To find the most rented type of bike
+most_rented_biketype <- bike_rental |>
+  count(rideable_type) |>
+  arrange(desc(n))
+
+
+# To find the day of the week with the most rentals
+day_most_rentals <- bike_rental |>
+  count(day_of_week) |>
+  arrange(desc(n))
+```
+On the above code, we are trying to find which type of bike is the most used in the year 2022 and what day of the week are people using the service (renting bikes)
+
+```{r}
+# Reordering factor levels based on frequency
+most_rented_biketype$rideable_type <- factor(
+  most_rented_biketype$rideable_type,
+  levels = most_rented_biketype$rideable_type[order(most_rented_biketype$n, decreasing = TRUE)]
+)
+# Define a color palette for each bike type
+my_colors <- c("#FF5733", "#33FF57", "#3366FF")
+
+# Bar graph for most rented bike types with reordered levels
+ggplot(most_rented_biketype, aes(x = rideable_type, y = n)) +
+  geom_bar(stat = "identity",fill = my_colors, alpha = 0.7) +
+  scale_fill_manual(values = my_colors) + 
+  labs(title = "Most Rented Bike Types",
+       subtitle = "Type of bikes rented during the year 2022",
+       x = "Bike Type", y = "Total Rentals") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0, size = 13),
+        plot.subtitle = element_text(hjust = 0, size = 9))
+```
+
+As we can see from the above graph, the type of bike most used throughout the year is classic_bike with `2249686` total trips followed by the electric_bike with `792608` total trips and docked_bike being the last one with `26698` total rides
+
+```{r}
+# Reordering factor levels based on the order of days in a week (Monday to Sunday)
+day_most_rentals$day_of_week <- factor(
+  day_most_rentals$day_of_week,
+  levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+)
+
+my_colors_day <- c("#FF5733", "#33FF57", "#3366FF", "#FF33F0", "#33FFFF", "#FFA500", "#800080")
+
+# Bar graph for day of the week with the most rentals
+ggplot(day_most_rentals, aes(x = day_of_week, y = n)) +
+  geom_bar(stat = "identity", fill = my_colors_day, alpha = 0.7) +
+  labs(title = "Day of the Week with Most Rentals", x = "Day of the Week", y = "Total Rentals", subtitle = "Total bike rentals by day of the week during the year 2022") +
+  theme_minimal() +
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0, size = 13),
+        plot.subtitle = element_text(hjust = 0, size = 9))
+```
+
+As we can see from the above graph, the day in which there were most total trips during the year 2022 was Wednesday, followed by Thursday, Friday, Saturday, Tuesday, Monday, and Sunday. This could mean that people use rental bikes to commute from their houses to their working place and back.
+
+#### Top Stations
+```{r}
+# Combine dataframes
+combined_usage <- rbind(
+  cbind(top_start_station_usage, type = "Start"),
+  cbind(top_end_station_usage, type = "End")
+)
+
+# Calculate total usage for each station
+total_usage <- combined_usage |>
+  group_by(station_name, type) |>
+  summarise(total = sum(usage)) |>
+  ungroup()
+
+# Order stations by total usage in ascending order
+ordered_stations <- total_usage |>
+  arrange(type, total) |>
+  distinct(station_name, .keep_all = TRUE) |>
+  pull(station_name)
+
+# Reorder station_name as a factor with the new order
+combined_usage$station_name <- factor(
+  combined_usage$station_name, 
+  levels = ordered_stations
+)
+
+# Plot combined side-by-side bar graph with reordered stations
+ggplot(combined_usage, aes(x = station_name, y = usage, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  labs(title = "Top Stations by Usage", x = "Station Name", y = "Usage", fill = "Type", subtitle = "Most transited station in 2022") +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        plot.title = element_text(hjust = 0, size = 13),
+        plot.subtitle = element_text(hjust = 0, size = 9)) +
+  scale_fill_manual(values = c("Start" = "darkblue", "End" = "orange")) 
+  
+```
+
+As we can observe the top 10 start point stations are also the top 10 end point stations for the year 2022. This could mean that people use the bike to transit from their work place. 
+
+```{r}
+# Merge top start and end stations
+combined_usage <- rbind(top_start_station_usage, top_end_station_usage)
+
+# Get unique stations with their latitude, longitude, and usage
+unique_stations <- combined_usage |>
+  group_by(station_name) |>
+  summarise(lat = first(start_lat), lng = first(start_lng), total_usage = sum(usage))
+```
+The above code creates a new data frame combining the total transit of users by station name.
+
+Lets plot the stations into the NYC map to see their locations.
+```{r}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+counties <- sf::st_as_sf(maps::map("county", plot = FALSE,
+                                   fill = TRUE))
+# Plotting the map with station points sized by total_usage and zoomed in
+ggplot(data = world) + 
+  geom_sf(data = counties, fill = NA, color = gray(0.5)) +
+  geom_point(data = unique_stations, aes(x = lng, y = lat, size = total_usage),
+             shape = 23, fill = "darkred", color = "black") +
+  geom_label_repel(data = unique_stations, aes(x = lng, y = lat, label = station_name),
+                   size = 3, box.padding = 0.5, segment.color = "transparent") +
+  labs(title = "Top 10 stations in NYC", subtitle = "Top 10 most transitated stations in NYC in 2022") +
+  scale_size_continuous(range = c(1, 4)) +
+  coord_sf(xlim = c(-74.02, -73.94), ylim = c(40.7, 40.8), expand = FALSE) +
+  theme(plot.title = element_text(hjust = 0, size = 13),
+        plot.subtitle = element_text(hjust = 0, size = 9))
+print(unique_stations|>arrange(desc(total_usage))|> select(station_name,total_usage))
+```
+We can see know where the top 10 most transited stations are located within the NYC map. The second tibble prints out in descending order by *total_usage* these top 10 stations. 
+
+## Results
+
+Bike Rentals Analysis
+
+  The analysis of New York City's bike rentals revealed several significant insights. By examining factors such as day of the week, month, and weather conditions, we aimed to determine their impact on bike rental volumes. The exploration led us to consider the predictive capabilities of these factors in anticipating the number of bike rentals. The data, sourced from NYC's bike rental website and weather metrics for 2022, underwent thorough wrangling and preprocessing to enable meaningful analysis.
+
+Weather Impact?
+
+  Our linear regression model indicated that average daily temperature, day of the month, and month of the year collectively explain approximately 73.9% of the variability in bike rental volumes. The analysis revealed a positive correlation between temperature and bike rentals, suggesting that warmer weather tends to attract more riders. However, when considering all possible models, it became evident that temperature played a crucial role, overshadowing the significance of day and month. Weather conditions and icons, while contributing to model accuracy, had lower predictive power individually. Outliers in certain weather conditions may have influenced these results.
+  
+EDA trends 
+  
+  Most Rented Bike Types: The classic bike emerged as the most frequently used, with 2,249,686 total trips, followed by the electric bike (792,608 trips) and the docked bike (26,698 trips). This finding provides valuable insights into user preferences and can guide bike-sharing program adjustments.
+
+Day of the Week Trends: Wednesday recorded the highest total bike rentals, indicating midweek popularity. Thursday, Friday, and Saturday also exhibited substantial usage. The data suggests a pattern of increased bike rentals during weekdays, possibly tied to commuting behaviors.
+
+Top Stations: The top ten most transited stations for both starting and ending trips were identified. Notably, these stations overlap, emphasizing their significance in the bike rental network. This alignment suggests that people use bike rentals for commuting purposes, as these stations likely connect residential and work areas.
+
+
+
+## Discussion
+
+Temperature as a Dominant Predictor
+
+  While the influence of temperature on bike rentals is evident, it's important to note that other factors, though contributing to model accuracy, exhibit lower predictive power individually. Weather conditions and icons, for instance, play a role but to a lesser extent. The nuanced interplay of these elements suggests a complex relationship between weather and bike rental behavior. Additionally, the impact of outliers in certain weather conditions prompts further exploration to understand instances where deviations from the expected pattern occur.
+
+Insights from Exploratory Data Analysis (EDA)
+
+Bike Type Preferences
+The EDA reveals valuable insights into user preferences regarding bike types. The classic bike emerges as the clear frontrunner, with a staggering 2,249,686 total trips. This dominance, followed by the electric bike and the docked bike, directs attention to the need for tailoring bike-sharing programs to meet the demand for classic bikes. Understanding the popularity of specific bike types can guide inventory management and service optimization.
+
+Temporal Usage Patterns
+
+Examining the day of the week trends sheds light on the temporal dynamics of bike rentals. Wednesday stands out as the day with the highest total bike rentals, indicative of midweek popularity. Substantial usage is also observed on Thursday, Friday, and Saturday, suggesting a pattern of increased bike rentals during weekdays, potentially associated with commuting behaviors. These insights into temporal patterns offer a valuable foundation for operational planning and resource allocation within the bike-sharing system.
+
+Significance of Top Stations
+
+Identifying the top ten most transited stations for both starting and ending trips underscores their central role in the bike rental network. The overlap between these stations highlights their significance, suggesting that they likely serve as key connection points between residential and work areas. This spatial concentration of bike rentals provides actionable insights for optimizing station placement and distribution, facilitating a more efficient and user-friendly bike-sharing experience.
+
+Finally this study can be easily replicated in other major cities and locations, thus potentially enhancing efficient and accessibility of bike systems in regions across the globe.
+
+
+
+## Conclusion
+
+In conclusion, our analysis demonstrated the multifaceted influence of Temporal factors,bike types, and time of week/ month on New York City's bike rental volumes. Temperature emerged as a dominant predictor, with warmer conditions associated with an increased bike usage. The popularity of classic bikes and the concentration of rentals on specific weekdays and stations provided actionable insights for optimizing bike-sharing services. These findings can guide city planners, bike rental providers, and policymakers in enhancing the efficiency and accessibility of bike-sharing programs in urban environments.
+
+
